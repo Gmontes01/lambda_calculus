@@ -1,0 +1,8 @@
+TRUE = \x y . x;
+FALSE = \x y . y;
+NOT = \f x y. f y x;
+************************
+My Custom Logic Test
+
+NOT 
+(TRUE)

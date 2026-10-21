@@ -1,0 +1,18 @@
+""" This is a standard boolean definition """
+TRUE = \x y . x;
+FALSE = \x y . y; """ Inline comment about false """
+
+"""
+This is a multi-line block comment
+explaining how the Church Pair is constructed.
+"""
+PAIR = \x y f . f x y;
+FST = \p . p TRUE;
+SND = \p . p FALSE;
+SWAP = \p . PAIR (SND p) (FST p);
+COMPLEX_PAIR = SWAP (PAIR TRUE FALSE);
+************************
+Comment Test Target
+
+""" Target function evaluating the pair """
+FST COMPLEX_PAIR

@@ -1,0 +1,14 @@
+TRUE = \x y . x;
+FALSE = \x y . y;
+PAIR = \x y f . f x y;
+FST = \p . p TRUE;
+SND = \p . p FALSE;
+SWAP = \p . PAIR (SND p) (FST p);
+COMPLEX_PAIR = SWAP (PAIR TRUE FALSE);
+OMEGA = (\x. x x) (\x. x x);
+
+
+************************
+Deep Dependency Church Pair Test
+
+FST COMPLEX_PAIR
