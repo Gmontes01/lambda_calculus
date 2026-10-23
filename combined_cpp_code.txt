@@ -1,0 +1,2116 @@
+================================================================================
+PROJECT DIRECTORY STRUCTURE
+================================================================================
+
+lambda_calculus/
+├── include/
+│   ├── environment.h
+│   ├── lambda_expression.h
+│   └── lambda_parser.h
+├── src/
+│   ├── environment.cpp
+│   ├── lambda_compiler.cpp
+│   ├── lambda_expression.cpp
+│   └── lambda_parser.cpp
+└── tests/
+    ├── environment_tests.cpp
+    ├── lambda_expression_tests.cpp
+    ├── lambda_parser_tests.cpp
+    └── master_tester.cpp
+
+Total Files Found: 11
+
+================================================================================
+SOURCE CODE CONTENTS
+================================================================================
+
+================================================================================
+FILE: include\environment.h
+================================================================================
+
+#pragma once
+#include <string>
+#include <unordered_map>
+#include "lambda_expression.h"
+
+/**
+ * @brief Represents the complete state of a parsed Lambda Calculus program.
+ */
+struct ProgramEnvironment {
+    std::unordered_map<std::string, lambda_expression*> variables;
+    lambda_expression* evaluation_target = nullptr; 
+    std::string target_name = "";
+
+    void combine_environments(ProgramEnvironment* pe);
+    void reduce_variables();
+    lambda_expression* express(lambda_expression* target);
+};
+
+/**
+ * @brief Parses a complete program containing variable assignments, an optional title, 
+ * and a final multi-line expression.
+ */
+ProgramEnvironment parse_program(const std::string& source_code);
+
+
+
+
+================================================================================
+FILE: include\lambda_expression.h
+================================================================================
+
+#pragma once
+#include <string>
+
+// 1. Types
+enum class NodeType { VARIABLE, LAMBDA, APPLICATION };
+
+// 2. Struct Declaration (Signatures Only)
+struct lambda_expression {
+    NodeType type;
+    std::string name;
+
+    lambda_expression* expression_1;
+    lambda_expression* expression_2;
+
+    static lambda_expression* deepcopy(const lambda_expression* node);
+    bool is_valid() const;
+    bool is_redux();
+    
+    void rename(const std::string& old_name, const std::string& new_name);
+    void rename_free(const std::string& old_name, const std::string& new_name);
+    void rename_bound(const std::string& old_name, const std::string& new_name);
+    
+    bool occurs_free_in(const std::string& var) const;
+    std::string generate_fresh_name(const std::string& base, const lambda_expression* replacement) const;
+    void substitute(const std::string& var, const lambda_expression* replacement);
+    
+    void reduce_total(int MAX_DEPTH = 1000);
+
+
+    bool reduce();
+    std::string to_string() const;
+    
+    ~lambda_expression();
+
+    bool operator==(const lambda_expression& other) const;//alpha equivalence up to combinator variable names
+    bool beta_equivalence(const lambda_expression& other, int max_depth) const;//beta equivalence
+};
+
+// 3. Factory Function Signatures
+lambda_expression* make_var(const std::string& name);
+lambda_expression* make_lambda(const std::string& bound_var, lambda_expression* body);
+lambda_expression* make_app(lambda_expression* func, lambda_expression* arg);
+
+================================================================================
+FILE: include\lambda_parser.h
+================================================================================
+
+#pragma once
+#include <string>
+#include <vector>
+#include "lambda_expression.h"
+
+// Public API for the parser
+std::vector<std::string> tokenize(const std::string& str);
+lambda_expression* parse_string(const std::string& str);
+
+================================================================================
+FILE: src\environment.cpp
+================================================================================
+
+#include "../include/environment.h"
+#include "../include/lambda_parser.h"
+
+
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <new> // Required for std::bad_alloc
+
+using namespace std;
+
+// ==========================================
+// STRING PARSING HELPERS
+// ==========================================
+
+string trim(const string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+bool is_valid_var_name(const string& s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        if (!isalpha(c) && c != '_') return false;
+    }
+    return true;
+}
+
+bool is_separator(const string& line) {
+    string t = trim(line);
+    if (t.length() < 3) return false;
+    for (char c : t) {
+        if (c != '*') return false;
+    }
+    return true;
+}
+
+string remove_comments(const string& source) {
+    string result = "";
+    bool in_comment = false;
+    
+    for (size_t i = 0; i < source.length(); ++i) {
+        // Look ahead to see if the next three characters are quotes
+        if (i + 2 < source.length() && source[i] == '"' && source[i+1] == '"' && source[i+2] == '"') {
+            in_comment = !in_comment; // Toggle the state (Open -> Close, or Close -> Open)
+            i += 2; // Skip the next two quotes so we don't process them again
+        } 
+        // Only keep characters if we are NOT inside a comment
+        else if (!in_comment) {
+            result += source[i]; 
+        }
+    }
+    
+    if (in_comment) {
+        // We use '\"' to safely print quotation marks in the error message
+        throw runtime_error("Syntax Error: Unclosed comment detected. Missing a closing '\"\"\"'.");
+    }
+    
+    return result;
+}
+
+// ==========================================
+// THE ORCHESTRATOR
+// ==========================================
+
+ProgramEnvironment parse_program(const string& source_code) {
+    string clean_code = remove_comments(source_code);
+    
+    istringstream stream(clean_code);
+    string line;
+
+    string assignment_block = "";
+    string eval_block = "";
+    bool in_eval_section = false;
+    bool first_eval_line_checked = false;
+
+    ProgramEnvironment env;
+    env.evaluation_target = nullptr;
+    env.target_name = "";
+
+    // 1. Separate the text into Assignments, Title, and Evaluation Code
+    while (getline(stream, line)) {
+        if (!in_eval_section && is_separator(line)) {
+            in_eval_section = true;
+            continue;
+        }
+        
+        if (in_eval_section) {
+            string trimmed = trim(line);
+            if (trimmed.empty()) continue; 
+
+            if (!first_eval_line_checked) {
+                first_eval_line_checked = true;
+                
+                if (trimmed.find('\\') == string::npos && 
+                    trimmed.find("λ") == string::npos && 
+                    trimmed.find('(') == string::npos &&
+                    trimmed.find('.') == string::npos &&
+                    trimmed.find("lambda") == string::npos) {
+                    
+                    env.target_name = trimmed; 
+                    continue; 
+                }
+            }
+            
+            eval_block += line + " ";
+        } else {
+            assignment_block += line + " ";
+        }
+    }
+
+    // 2. Parse the Assignments (Statements ending in ';')
+    size_t start = 0;
+    size_t end = assignment_block.find(';');
+    
+    while (end != string::npos) {
+        string stmt = trim(assignment_block.substr(start, end - start));
+        
+        if (!stmt.empty()) {
+            size_t eq_pos = stmt.find('=');
+            if (eq_pos == string::npos) throw runtime_error("Syntax Error: Missing '=' -> " + stmt);
+
+            string var_name = trim(stmt.substr(0, eq_pos));
+            string expr_str = trim(stmt.substr(eq_pos + 1));
+
+            if (!is_valid_var_name(var_name)) throw runtime_error("Syntax Error: Invalid variable name '" + var_name + "'");
+            if (expr_str.empty()) throw runtime_error("Syntax Error: Missing expression for '" + var_name + "'");
+
+            // ==========================================
+            // COLLISION CHECK ADDED HERE
+            // ==========================================
+            if (env.variables.find(var_name) != env.variables.end()) {
+                throw runtime_error("Syntax Error: Naming collision. The variable '" + var_name + "' is already defined.");
+            }
+
+            lambda_expression* ast = parse_string(expr_str);
+            if (!ast) throw runtime_error("Parse Error: Failed to build AST for '" + var_name + "'.");
+
+            for (const pair<string, lambda_expression*>& pair : env.variables) {
+                ast->substitute(pair.first, pair.second);
+            }
+            env.variables[var_name] = ast;
+        }
+        
+        start = end + 1;
+        end = assignment_block.find(';', start);
+    }
+
+    string dangling = trim(assignment_block.substr(start));
+    if (!dangling.empty()) throw runtime_error("Syntax Error: Missing semicolon ';' after -> " + dangling);
+
+    // 3. Parse the Final Evaluation Block
+    eval_block = trim(eval_block);
+    if (!eval_block.empty()) {
+        env.evaluation_target = parse_string(eval_block);
+        if (!env.evaluation_target) {
+            throw runtime_error("Parse Error: Failed to build AST for the final evaluation block.");
+        }
+        
+        for (const pair<string, lambda_expression*>& pair : env.variables) {
+            env.evaluation_target->substitute(pair.first, pair.second);
+        }
+    }
+
+    return env;
+}
+
+
+void ProgramEnvironment::combine_environments(ProgramEnvironment* pe) {
+    if (pe == nullptr) return;
+
+    for (const pair<string, lambda_expression*>& pair : pe->variables) {
+        const string& var_name = pair.first;
+        lambda_expression* incoming_ast = pair.second;
+
+        // Check if the variable name already exists in OUR environment
+        if (this->variables.find(var_name) != this->variables.end()) {
+            throw runtime_error("Environment Merge Error: Naming collision detected. The variable '" + 
+                                var_name + "' already exists.");
+        }
+
+        // If no collision, add it to our environment
+        this->variables[var_name] = incoming_ast;
+    }
+
+    // Safety Step: Clear the incoming environment's variables so it doesn't 
+    // accidentally double-delete the AST pointers when it gets destroyed later.
+    pe->variables.clear();
+}
+
+/**
+ * @brief Iterates through all stored variables in the environment and 
+ * fully beta-reduces them to their Normal Form.
+ * * This is a critical optimization pass. By ensuring all variables are in 
+ * normal form, the compiler can use O(1) Alpha Equivalence structural 
+ * checks during the resugaring (express) phase, rather than O(n^2) tree reductions.
+ */
+void ProgramEnvironment::reduce_variables() {
+    // Iterate over every variable bound in the current environment
+    for (pair<const string, lambda_expression*>& env_var : this->variables) {
+        const string& var_name = env_var.first;
+        lambda_expression* ast = env_var.second;
+
+        lambda_expression* copy = lambda_expression::deepcopy(ast);
+
+        if (ast == nullptr) continue; 
+
+        try {
+            // Attempt to pre-evaluate the AST completely.
+            
+            copy->reduce_total();
+            delete ast;
+            env_var.second = copy;
+            
+        } catch (const std::bad_alloc& e) {
+            // SWALLOW MEMORY EXPLOSION: Catches heap exhaustion anywhere in the AST.
+            cerr << "[Warning] Variable '" << var_name 
+                 << "' triggered Exponential Blowup (ran out of RAM) during pre-computation. "
+                 << "It has been safely stored unreduced." << endl;
+                 
+        } catch (const runtime_error& e) {
+            // SWALLOW DIVERGENCE: Preserves lazy evaluation by allowing infinite 
+            // combinators to exist in the environment as long as they aren't executed.
+            cerr << "[Warning] Variable '" << var_name 
+                 << "' failed to reduce during pre-computation (" << e.what() << "). "
+                 << "It has been safely stored unreduced." << endl;
+        }
+    }
+}
+
+lambda_expression* ProgramEnvironment::express(lambda_expression* target) {
+    if (target == nullptr) return nullptr;
+
+    switch (target->type) {
+        case NodeType::VARIABLE: 
+            // Variables are already fully folded, no need to check or recurse
+            return target;
+            
+        case NodeType::LAMBDA: 
+        case NodeType::APPLICATION: {
+            // 1. GREEDY PATTERN MATCHING (Maximal Munch)
+            // Check if this entire subtree is beta-equivalent to a saved variable.
+            for (const pair<string, lambda_expression*>& env_var : this->variables) {
+                
+                // Dereference the stored pointer to trigger your alpha_equivalence overload
+                if (*target == *(env_var.second)) {
+                    
+                    // Memory Safety: Since we are replacing this entire complex subtree,
+                    // we must delete it to free the heap memory (which triggers its 
+                    // recursive destructor), and return a brand new, clean variable node.
+                    delete target;
+                    return make_var(env_var.first);
+                }
+            }
+            // 2. RECURSION
+            // If the whole block didn't match anything, step one level deeper.
+            if (target->type == NodeType::LAMBDA) {
+                target->expression_1 = express(target->expression_1);
+            } else { // APPLICATION
+                target->expression_1 = express(target->expression_1);
+                target->expression_2 = express(target->expression_2);
+            }
+            return target;
+        }
+        default: 
+            return target;
+    }
+}
+
+================================================================================
+FILE: src\lambda_compiler.cpp
+================================================================================
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include "../include/environment.h"
+
+using namespace std;
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        cerr << "Usage: " << argv[0] << " <filename.lc>" << endl;
+        return 1;
+    }
+
+    string filepath = argv[1];
+    ifstream file(filepath);
+    
+    if (!file.is_open()) {
+        cerr << "Fatal Error: Could not open file '" << filepath << "'" << endl;
+        return 1;
+    }
+
+    stringstream buffer;
+    buffer << file.rdbuf();
+    string source_code = buffer.str();
+    file.close();
+
+    try {
+        ProgramEnvironment env = parse_program(source_code);
+
+        cout << "=== Environment Loaded ===" << endl;
+        for (const pair<string, lambda_expression*>& pair : env.variables) {
+            cout << pair.first << " = " << pair.second->to_string() << endl;
+        }
+        cout << "==========================\n" << endl;
+
+        if (env.evaluation_target != nullptr) {
+            if (!env.target_name.empty()) {
+                cout << "Evaluating: " << env.target_name << endl;
+            } else {
+                cout << "Evaluating: " << env.evaluation_target->to_string() << endl;
+            }
+            
+            env.evaluation_target->reduce_total();
+            lambda_expression* simplified_lambda_ex = lambda_expression::deepcopy(env.evaluation_target);
+            env.reduce_variables();
+            
+            cout << "Result:     " << env.express(simplified_lambda_ex)->to_string() << endl;
+            
+            delete env.evaluation_target;
+        } else {
+            cout << "No execution block found. Variables loaded successfully." << endl;
+        }
+
+
+    } catch (const exception& e) {
+        cerr << "\n[COMPILER ERROR]\n" << e.what() << endl;
+        return 1;
+    }
+
+    return 0;
+}
+
+================================================================================
+FILE: src\lambda_expression.cpp
+================================================================================
+
+#include "../include/lambda_expression.h"
+
+#include <unordered_map>
+#include <string>
+
+#include <stdexcept>
+#include <iostream>
+
+#include <new> // Required to catch std::bad_alloc
+
+using namespace std;
+
+/**
+ * @brief Creates a deep, independent copy of an Abstract Syntax Tree (AST).
+ * * In C++, if you assign one pointer to another, they both point to the same memory.
+ * If one is deleted, the other becomes a dangling pointer. This function recursively
+ * allocates new memory for every node in the tree to ensure complete independence.
+ * * @param node A pointer to the root of the tree you want to copy.
+ * @return A pointer to the root of the newly allocated tree.
+ */
+lambda_expression* lambda_expression::deepcopy(const lambda_expression* node) {
+    if (node == nullptr) return nullptr;
+    
+    lambda_expression* copy = new lambda_expression();
+    copy->type = node->type;
+    copy->name = node->name;
+    copy->expression_1 = deepcopy(node->expression_1);
+    copy->expression_2 = deepcopy(node->expression_2);
+    
+    return copy;
+}
+
+/**
+ * @brief Validates the structural integrity of the AST node.
+ * * Ensures that the memory structure matches the rules of Lambda Calculus.
+ * For example, a VARIABLE cannot have children, and an APPLICATION must have both.
+ * * @return True if the node is mathematically sound, false if memory is corrupted or malformed.
+ */
+bool lambda_expression::is_valid() const {
+    switch (type) {
+        case NodeType::VARIABLE:
+            return !name.empty() && expression_1 == nullptr && expression_2 == nullptr;
+        case NodeType::LAMBDA:
+            return !name.empty() && expression_1 != nullptr && expression_2 == nullptr && expression_1->is_valid();
+        case NodeType::APPLICATION:
+            return name.empty() && expression_1 != nullptr && expression_2 != nullptr && expression_1->is_valid() && expression_2->is_valid();
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Checks if the current node is a Reducible Expression (Redex).
+ * * A redex only exists when a function (LAMBDA) is applied to an argument.
+ * Therefore, the current node must be an APPLICATION, and its left child must be a LAMBDA.
+ * * @return True if the node can be beta-reduced.
+ */
+bool lambda_expression::is_redux() {
+    return type == NodeType::APPLICATION && expression_1->type == NodeType::LAMBDA;
+}
+
+/**
+ * @brief Public interface to rename free variables.
+ * * Aliases to rename_free to keep the public API clean and intuitive.
+ */
+void lambda_expression::rename(const string& old_name, const string& new_name) {
+    this->rename_free(old_name, new_name);
+}
+
+/**
+ * @brief Recursively renames variables that are "free" (not bound by a local lambda).
+ * * If it encounters a LAMBDA that binds the `old_name` (e.g., renaming 'x' inside \x. x),
+ * it stops recursing, because the inner 'x' is shadowed and belongs to the inner lambda, 
+ * not the outer scope.
+ */
+void lambda_expression::rename_free(const string& old_name, const string& new_name) {
+    switch (type) {
+        case NodeType::VARIABLE:
+            if (this->name == old_name) this->name = new_name;
+            break;
+        case NodeType::APPLICATION:
+            this->expression_1->rename_free(old_name, new_name);
+            this->expression_2->rename_free(old_name, new_name);
+            break;
+        case NodeType::LAMBDA:
+            if (this->name == old_name) {
+                // Shadowing detected. Rename the binder and switch to rename_bound 
+                // to force all instances in the body to match the new binder name.
+                this->name = new_name;
+                this->expression_1->rename_bound(old_name, new_name);
+            } else {
+                // Not shadowed, keep traversing normally.
+                this->expression_1->rename_free(old_name, new_name);
+            }
+    }
+}
+
+/**
+ * @brief Force-renames all occurrences of a variable name regardless of standard shadowing rules.
+ * * This is primarily an internal helper used during alpha-conversion to aggressively 
+ * update a lambda's bound variable and all its internal references at once.
+ */
+void lambda_expression::rename_bound(const string& old_name, const string& new_name) {
+    switch (type) {
+        case NodeType::VARIABLE:
+            if (this->name == old_name) this->name = new_name;
+            break;
+        case NodeType::APPLICATION:
+            this->expression_1->rename_bound(old_name, new_name);
+            this->expression_2->rename_bound(old_name, new_name);
+            break;
+        case NodeType::LAMBDA:
+            if (this->name != old_name) this->expression_1->rename_bound(old_name, new_name);
+    }
+}
+
+/**
+ * @brief Scans the tree to see if a specific variable name exists "freely".
+ * * A variable is free if it is used without being wrapped in a lambda that binds it.
+ * This is a crucial prerequisite check for capture-avoiding substitution.
+ */
+bool lambda_expression::occurs_free_in(const string& var) const {
+    switch (type) {
+        case NodeType::VARIABLE: return name == var;
+        case NodeType::APPLICATION: return expression_1->occurs_free_in(var) || expression_2->occurs_free_in(var);
+        case NodeType::LAMBDA:
+            // If the lambda binds the variable we are looking for, it cannot occur free inside.
+            if (name == var) return false;
+            return expression_1->occurs_free_in(var);
+        default: return false;
+    }
+}
+
+/**
+ * @brief Generates a mathematically unique variable name (Alpha-Conversion).
+ * * If substituting `y` into `\y. x` causes a naming collision, this function appends 
+ * apostrophes (e.g., `y'`) until it finds a name that does not exist anywhere in the 
+ * current scope or the replacement term.
+ */
+string lambda_expression::generate_fresh_name(const string& base, const lambda_expression* replacement) const {
+    string candidate = base;
+    while (true) {
+        bool fresh = true;
+        if (expression_1 && expression_1->occurs_free_in(candidate)) fresh = false;
+        if (replacement && replacement->occurs_free_in(candidate)) fresh = false;
+        
+        if (fresh) break;
+        candidate += "'"; // Mutate and retry
+    }
+    return candidate;
+}
+
+/**
+ * @brief The core substitution engine: replaces instances of `var` with the `replacement` tree.
+ * * Features automatic capture avoidance. If a naming collision is detected, it pauses 
+ * the substitution to alpha-convert (rename) the conflicting bound variables, ensuring 
+ * mathematical meaning is preserved.
+ */
+void lambda_expression::substitute(const string& var, const lambda_expression* replacement) {
+    switch (type) {
+        case NodeType::VARIABLE:
+            if (name == var) {
+                // Deepcopy the replacement to prevent double-free memory corruption later.
+                lambda_expression* temp = deepcopy(replacement);
+                
+                // Inherit the replacement's properties (in-place mutation)
+                this->type = temp->type;
+                this->name = temp->name;
+                this->expression_1 = temp->expression_1;
+                this->expression_2 = temp->expression_2;
+                
+                // Nullify the temp pointers so its destructor doesn't delete our new children.
+                temp->expression_1 = nullptr;
+                temp->expression_2 = nullptr;
+                delete temp;
+            }
+            break;
+        case NodeType::APPLICATION:
+            expression_1->substitute(var, replacement);
+            expression_2->substitute(var, replacement);
+            break;
+        case NodeType::LAMBDA:
+            // Stop if the variable we are replacing is shadowed by this lambda.
+            if (name == var) return; 
+            
+            // Capture Avoidance Check
+            if (replacement->occurs_free_in(name)) {
+                string fresh = this->generate_fresh_name(name, replacement);
+                expression_1->rename_bound(name, fresh);
+                name = fresh;
+            }
+            expression_1->substitute(var, replacement);
+    }
+}
+
+/**
+ * @brief Drives the reduction process until a Normal Form is reached.
+ * * Uses a MAX_STEPS circuit breaker. If the evaluation loops infinitely 
+ * (e.g., the Omega combinator), it catches the divergence and throws an error 
+ * rather than hanging the system or overflowing the stack.
+ */
+void lambda_expression::reduce_total(int MAX_STEPS) {
+    int steps = 0;
+    try {
+        while (this->reduce()) {
+            if (steps >= MAX_STEPS) {
+                throw runtime_error("DIVERGENCE_ERROR: Maximum reduction steps exceeded");
+            }
+            steps++;
+        }
+    } catch (const std::bad_alloc& e) {
+        // C++ throws bad_alloc when the heap runs out of RAM.
+        // We intercept it and throw it as a standard runtime error so the 
+        // environment parser can safely swallow it!
+        throw runtime_error("MEMORY_ERROR: The expression experienced exponential blowup and exhausted system memory.");
+        
+    } catch (const runtime_error& e) {
+        // Standard timeout errors fall through here
+        cerr << "Reduction Failed: " << e.what() << endl;
+        throw; 
+    }
+}
+
+/**
+ * @brief Performs a single Normal Order (Lazy) beta-reduction step.
+ * * Normal Order means we always attempt to evaluate the leftmost-outermost redex first.
+ * This strategy guarantees we find a normal form if one exists, allowing us to safely 
+ * drop divergent (infinite) terms if they are passed as unused arguments.
+ * * @return True if a reduction occurred, false if no redexes remain.
+ */
+bool lambda_expression::reduce() {
+    // Top-Down Check: Attempt root reduction first
+    if (this->is_redux()) {
+        lambda_expression* lambda = this->expression_1;
+        lambda_expression* body = lambda->expression_1;
+        lambda_expression* argument = this->expression_2;
+
+        // Perform the mathematical substitution
+        body->substitute(lambda->name, argument);
+
+        // Splice the reduced body into the current node's location
+        this->type         = body->type;
+        this->name         = body->name;
+        this->expression_1 = body->expression_1;
+        this->expression_2 = body->expression_2;
+
+        // Clean up consumed nodes safely
+        body->expression_1 = nullptr;
+        body->expression_2 = nullptr;
+        delete body;                    
+        lambda->expression_1 = nullptr; 
+        delete lambda;                  
+        delete argument;
+        
+        return true;
+    } else {
+        // If root is not a redex, recurse left-to-right
+        switch (type) {
+            case NodeType::VARIABLE: return false;
+            case NodeType::LAMBDA: return this->expression_1->reduce();
+            case NodeType::APPLICATION:
+                // Short-circuiting: If left reduces, stop. Ensures lazy evaluation.
+                if (this->expression_1->reduce()) return true;
+                return this->expression_2->reduce();
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Destructor.
+ * Recursively deletes child nodes. If children are set to nullptr, `delete nullptr` 
+ * does nothing, making it safe.
+ */
+lambda_expression::~lambda_expression() {
+    delete expression_1;
+    delete expression_2;
+}
+
+
+// ==========================================
+// ALPHA EQUIVALENCE HELPER
+// ==========================================
+static bool is_alpha_equiv(const lambda_expression* a, 
+                           const lambda_expression* b, 
+                           std::unordered_map<std::string, std::string>& env_A_to_B,
+                           std::unordered_map<std::string, std::string>& env_B_to_A) {
+                           
+    // 1. Safety & Type Checks
+    if (a == nullptr && b == nullptr) return true;
+    if (a == nullptr || b == nullptr) return false;
+    if (a->type != b->type) return false;
+
+    switch (a->type) {
+        case NodeType::VARIABLE: {
+            // Explicitly defining the iterator types instead of using 'auto'
+            std::unordered_map<std::string, std::string>::iterator it_A = env_A_to_B.find(a->name);
+            std::unordered_map<std::string, std::string>::iterator it_B = env_B_to_A.find(b->name);
+            
+            bool a_is_bound = (it_A != env_A_to_B.end());
+            bool b_is_bound = (it_B != env_B_to_A.end());
+
+            if (a_is_bound && b_is_bound) {
+                // Both are bound variables: they must map directly to each other
+                return it_A->second == b->name;
+            } else if (!a_is_bound && !b_is_bound) {
+                // Neither are bound: they are free variables and must have the exact same name
+                return a->name == b->name;
+            } else {
+                // One is bound and the other is free: automatic mismatch
+                return false;
+            }
+        }
+
+        case NodeType::APPLICATION:
+            return is_alpha_equiv(a->expression_1, b->expression_1, env_A_to_B, env_B_to_A) &&
+                   is_alpha_equiv(a->expression_2, b->expression_2, env_A_to_B, env_B_to_A);
+
+        case NodeType::LAMBDA: {
+            // STEP 1: SAVE PREVIOUS STATE (Handles variable shadowing)
+            bool a_had_prev = env_A_to_B.count(a->name);
+            std::string prev_A = a_had_prev ? env_A_to_B[a->name] : "";
+            
+            bool b_had_prev = env_B_to_A.count(b->name);
+            std::string prev_B = b_had_prev ? env_B_to_A[b->name] : "";
+
+            // STEP 2: APPLY NEW BINDINGS FOR THIS SCOPE
+            env_A_to_B[a->name] = b->name;
+            env_B_to_A[b->name] = a->name;
+            
+            // STEP 3: RECURSE
+            bool bodies_match = is_alpha_equiv(a->expression_1, b->expression_1, env_A_to_B, env_B_to_A);
+            
+            // STEP 4: RESTORE PREVIOUS STATE (Pops the scope safely)
+            if (a_had_prev) env_A_to_B[a->name] = prev_A;
+            else env_A_to_B.erase(a->name);
+            
+            if (b_had_prev) env_B_to_A[b->name] = prev_B;
+            else env_B_to_A.erase(b->name);
+            
+            return bodies_match;
+        }
+    }
+    return false;
+}
+
+// ==========================================
+// EQUALITY OPERATOR OVERLOAD
+// ==========================================
+bool lambda_expression::operator==(const lambda_expression& other) const {
+    // Instantiate the dual maps for O(1) bijection lookups
+    std::unordered_map<std::string, std::string> env_A_to_B;
+    std::unordered_map<std::string, std::string> env_B_to_A;
+    
+    // Fire the recursive helper
+    return is_alpha_equiv(this, &other, env_A_to_B, env_B_to_A);
+}
+
+/**
+ * @brief Serializes the AST back into a human-readable mathematical string.
+ */
+string lambda_expression::to_string() const {
+    switch (type) {
+        case NodeType::VARIABLE: return name;
+        case NodeType::LAMBDA: return "(λ" + name + ". " + expression_1->to_string() + ")";
+        case NodeType::APPLICATION: return "(" + expression_1->to_string() + " " + expression_2->to_string() + ")";
+        default: return "<malformed>";
+    }
+}
+bool lambda_expression::beta_equivalence(const lambda_expression& other, int max_depth) const {
+    // 1. Pass the pointers to your static deepcopy function
+    lambda_expression* le_0 = deepcopy(this);
+    lambda_expression* le_1 = deepcopy(&other);
+
+    bool is_equiv = false;
+
+    // 2. Wrap the reduction in a try-catch to ensure memory safety
+    try {
+        // Pass the max_depth safeguard down the chain
+        le_0->reduce_total(max_depth);
+        le_1->reduce_total(max_depth);
+
+        // 3. Dereference the pointers to trigger your overloaded Alpha equivalence operator
+        is_equiv = (*le_0 == *le_1);
+        
+    } catch (...) {
+        // If reduce_total hits an infinite loop and throws an error,
+        // we MUST clean up the copied trees before passing the error up!
+        delete le_0;
+        delete le_1;
+        throw; // Re-throw the original error to the user
+    }
+
+    // 4. Standard memory cleanup for a successful run
+    delete le_0;
+    delete le_1;
+
+    return is_equiv;
+}
+
+// ---- Factories ----
+
+/** @brief Instantiates a basic variable node on the heap. */
+lambda_expression* make_var(const string& name) {
+    lambda_expression* node = new lambda_expression();
+    node->type = NodeType::VARIABLE;
+    node->name = name;
+    node->expression_1 = nullptr;
+    node->expression_2 = nullptr;
+    return node;
+}
+
+/** @brief Instantiates a lambda abstraction, capturing the given body tree. */
+lambda_expression* make_lambda(const string& bound_var, lambda_expression* body) {
+    lambda_expression* node = new lambda_expression();
+    node->type = NodeType::LAMBDA;
+    node->name = bound_var;
+    node->expression_1 = body;
+    node->expression_2 = nullptr;
+    return node;
+}
+
+/** @brief Instantiates an application of a function to an argument. */
+lambda_expression* make_app(lambda_expression* func, lambda_expression* arg) {
+    lambda_expression* node = new lambda_expression();
+    node->type = NodeType::APPLICATION;
+    node->name = "";
+    node->expression_1 = func;
+    node->expression_2 = arg;
+    return node;
+}
+
+================================================================================
+FILE: src\lambda_parser.cpp
+================================================================================
+
+#include "../include/lambda_parser.h"
+#include <unordered_set>
+#include <stdexcept>
+#include <iostream>
+
+using namespace std;
+
+// ==========================================
+// STEP 1: THE LEXER (Tokenization)
+// ==========================================
+
+/**
+ * @brief Converts a continuous string of text into discrete, actionable tokens.
+ * * The Lexer scans byte-by-byte. It ignores whitespace, treats special characters 
+ * as standalone delimiters, and continuously accumulates alphanumeric characters 
+ * into complete variable names (e.g., separating "var_x" from ".").
+ * * @param str The raw input string from the user or file.
+ * @return A vector of clean strings representing syntax tokens.
+ */
+vector<string> tokenize(const string& str) {
+    vector<string> tokens;
+    string curr_word = "";
+    
+    // The exact characters that trigger a split in Lambda Calculus grammar
+    unordered_set<char> delimiters = {' ', '.', '(', ')', ';', '\\'};
+
+    for (char c : str) {
+        if (delimiters.count(c)) {
+            // If we were building a variable name, save it before processing the delimiter
+            if (!curr_word.empty()) {
+                tokens.push_back(curr_word);
+                curr_word = "";
+            }
+            // Discard spaces, but keep mathematical symbols
+            if (c != ' ') tokens.push_back(string(1, c));
+        } else {
+            // Not a delimiter; accumulate into the current variable name
+            curr_word += c;
+        }
+    }
+    
+    // Flush any remaining characters in the buffer
+    if (!curr_word.empty()) tokens.push_back(curr_word);
+    
+    return tokens;
+}
+
+// ==========================================
+// STEP 2: THE PARSER (Recursive Descent)
+// ==========================================
+
+/**
+ * @brief The engine that translates a linear list of tokens into a hierarchical AST.
+ * * This class uses Recursive Descent. It consumes tokens from left to right and 
+ * relies on the C++ call stack (recursion) to handle nested parenthesis and scope, 
+ * eliminating the need to manually manage data stacks and booleans.
+ */
+class LambdaParser {
+private:
+    vector<string> tokens;
+    size_t pos;
+
+    /** @brief Looks at the current token without consuming it. */
+    string peek() { return (pos >= tokens.size()) ? "" : tokens[pos]; }
+    
+    /** @brief Consumes the current token and moves the internal cursor forward. */
+    string advance() { return (pos >= tokens.size()) ? "" : tokens[pos++]; }
+
+    /**
+     * @brief Parses a single self-contained unit (Atom).
+     * * An atom is either a variable, an entire parenthesized expression, or a lambda.
+     * This function contains the logic for Greedy Lambda Scope and Automatic Currying.
+     */
+    lambda_expression* parse_atom() {
+        string t = peek();
+
+        // Rule 1: Parentheses override scope. Recurse entirely until the matching ')'
+        if (t == "(") {
+            advance();
+            lambda_expression* expr = parse_expression();
+            if (advance() != ")") throw runtime_error("Parse Error: Missing closing ')'");
+            return expr;
+        } 
+        
+        // Rule 2: Lambda functions
+        else if (t == "lambda" || t == "λ" || t == "\\") {
+            advance();
+            
+            // Automatic Currying: Collect all variables (e.g., \x y z .)
+            vector<string> bound_vars;
+            while (peek() != "." && peek() != "") bound_vars.push_back(advance());
+            
+            if (bound_vars.empty()) throw runtime_error("Parse Error: Lambda missing variable");
+            if (advance() != ".") throw runtime_error("Parse Error: Expected '.' after variables");
+
+            // Greedy Scope: The body consumes everything else remaining in the expression
+            lambda_expression* body = parse_expression();
+            
+            // Unpack the curried variables inside-out to build the nested tree
+            for (int i = bound_vars.size() - 1; i >= 0; --i) {
+                body = make_lambda(bound_vars[i], body);
+            }
+            return body;
+        } 
+        
+        // Rule 3: End of statement marker
+        else if (t == ";") {
+            advance();
+            return nullptr;
+        }
+        
+        // Rule 4: If it's none of the above, it must be a standard variable
+        else {
+            advance();
+            return make_var(t);
+        }
+    }
+
+public:
+    LambdaParser(const vector<string>& t) : tokens(t), pos(0) {}
+
+    /**
+     * @brief Parses a full expression, enforcing Left-Associativity.
+     * * This function continuously applies new arguments to the existing expression
+     * from left to right. E.g., reading "x y z" results in ((x y) z).
+     */
+    lambda_expression* parse_expression() {
+        if (peek() == "") return nullptr;
+        
+        // Obtain the base function
+        lambda_expression* expr = parse_atom();
+
+        // Continuously consume remaining atoms and apply them to the base
+        while (peek() != "" && peek() != ")" && peek() != ";") {
+            lambda_expression* next_arg = parse_atom();
+            if (next_arg) expr = make_app(expr, next_arg);
+        }
+        
+        return expr;
+    }
+};
+
+// ==========================================
+// STEP 3: THE WRAPPER (Public API)
+// ==========================================
+
+/**
+ * @brief Safely orchestrates the Lexing and Parsing processes.
+ * * Provides a unified entry point for the rest of the program to convert strings 
+ * into ASTs. Wraps the engine in a try-catch block to prevent syntax errors 
+ * from causing fatal C++ segmentation faults.
+ */
+lambda_expression* parse_string(const string& str) {
+    try {
+        // Pass 1: Lexing
+        vector<string> tokens = tokenize(str);
+        if (tokens.empty()) return nullptr;
+
+        // Pass 2: Parsing
+        LambdaParser parser(tokens);
+        return parser.parse_expression();
+        
+    } catch (const exception& e) {
+        // Log syntax errors gracefully
+        cout << e.what() << endl;
+        return nullptr;
+    }
+}
+
+================================================================================
+FILE: tests\environment_tests.cpp
+================================================================================
+
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include "../include/environment.h"
+
+using namespace std;
+
+namespace EnvironmentTests {
+
+    // ---- test configuration ----
+    enum class Verbosity { QUIET, NORMAL, VERBOSE };
+    static Verbosity verbosity = Verbosity::NORMAL;  
+
+    int tests_passed = 0;
+    int tests_failed = 0;
+
+    // ---- Unified Reporter ----
+    void report(bool pass, const string& name, const string& input, 
+                const string& op, const string& expected, const string& actual) {
+        if (pass) {
+            ++tests_passed;
+            if (verbosity != Verbosity::QUIET) cout << "PASS " << name << "\n";
+        } else {
+            ++tests_failed;
+            if (verbosity != Verbosity::QUIET) cout << "FAIL " << name << "\n";
+        }
+
+        if (verbosity == Verbosity::VERBOSE || (!pass && verbosity == Verbosity::NORMAL)) {
+            cout << "   Input:     " << input << "\n";
+            cout << "   Operation: " << op << "\n";
+            cout << "   Expected:  " << expected << "\n";
+            cout << "   Actual:    " << actual << "\n";
+            cout << "   ---------------------------------------\n";
+        }
+    }
+
+    // ---- File IO Helper ----
+    string load_file(const string& filepath) {
+        ifstream file(filepath);
+        if (!file.is_open()) return "";
+        stringstream buffer;
+        buffer << file.rdbuf();
+        return buffer.str();
+    }
+
+    // ==========================================
+    // ENVIRONMENT TEST SUITE
+    // ==========================================
+
+    struct FileTestCase {
+        string filepath;
+        bool should_pass;
+        string expected_error_substring;
+    };
+
+    void test_all_files() {
+        vector<FileTestCase> test_files = {
+            {"tests/test_envs/valid_basic.lc", true, ""},
+            {"tests/test_envs/valid_infinite_uncalled_variable.lc", true, ""},
+            {"tests/test_envs/valid_comments.lc", true, ""}, // <--- Add this
+            {"tests/test_envs/err_missing_equals.lc", false, "Missing '='"},
+            {"tests/test_envs/err_invalid_varname.lc", false, "Invalid variable name"},
+            {"tests/test_envs/err_missing_expr.lc", false, "Missing expression"},
+            {"tests/test_envs/err_missing_semi.lc", false, "Missing semicolon ';'"},
+            {"tests/test_envs/err_parser_paren.lc", false, "Failed to build AST"},
+            {"tests/test_envs/err_parser_var.lc", false, "Failed to build AST"},
+            {"tests/test_envs/err_parser_dot.lc", false, "Failed to build AST"},
+            {"tests/test_envs/err_eval_block.lc", false, "Failed to build AST for the final evaluation block"},
+            {"tests/test_envs/err_unclosed_comment.lc", false, "Unclosed comment detected"},
+            {"tests/test_envs/err_variable_collision.lc", false, "Syntax Error: Naming collision. The variable 'TRUE' is already defined."},
+            {"tests/test_envs/valid_currying.lc", true, ""}
+        };
+        
+        // ... remainder of the function ...
+
+        for (const FileTestCase& test : test_files) {
+            string code = load_file(test.filepath);
+            
+            if (code.empty()) {
+                report(false, "File read: " + test.filepath, test.filepath, "load_file()", "File contents", "File not found or empty.");
+                continue;
+            }
+
+            // Suppress terminal output so the parser's internal couts don't spam our test results
+            stringstream dummy_buffer;
+            streambuf* original_cout = cout.rdbuf();
+            if (verbosity == Verbosity::QUIET || !test.should_pass) {
+                cout.rdbuf(dummy_buffer.rdbuf());
+            }
+
+            bool threw_error = false;
+            string error_msg = "";
+            ProgramEnvironment env;
+
+            try {
+                env = parse_program(code);
+            } catch (const runtime_error& e) {
+                threw_error = true;
+                error_msg = e.what();
+            }
+
+            // Restore terminal output
+            if (verbosity == Verbosity::QUIET || !test.should_pass) {
+                cout.rdbuf(original_cout);
+            }
+
+            if (test.should_pass) {
+                report(!threw_error, "parse valid: " + test.filepath, test.filepath, "parse_program()", "Successful parse", threw_error ? string("Exception: ") + error_msg : "Parsed without exceptions");
+            } else {
+                bool expected_msg = (error_msg.find(test.expected_error_substring) != string::npos);
+                string expected_desc = "Throws error containing '" + test.expected_error_substring + "'";
+                string actual_desc = threw_error ? "Threw: " + error_msg : "Did not throw exception";
+                
+                report(threw_error && expected_msg, "parse invalid: " + test.filepath, test.filepath, "parse_program()", expected_desc, actual_desc);
+            }
+
+            // Memory Cleanup (safely handles incomplete envs)
+            for (auto& pair : env.variables) delete pair.second;
+            delete env.evaluation_target;
+        }
+    }
+
+    void test_combine_environments_success() {
+        ProgramEnvironment base_env;
+        base_env.variables["VAR_A"] = make_var("a");
+
+        ProgramEnvironment incoming_env;
+        incoming_env.variables["VAR_B"] = make_var("b");
+
+        try {
+            base_env.combine_environments(&incoming_env);
+            
+            bool passed = (base_env.variables.size() == 2) && (incoming_env.variables.size() == 0);
+            report(passed, "combine: successful merge", "Base(VAR_A) + Incoming(VAR_B)", "combine_environments()", "Base has 2, Incoming empty", "Base has " + to_string(base_env.variables.size()) + ", Incoming has " + to_string(incoming_env.variables.size()));
+
+            for (auto& pair : base_env.variables) delete pair.second;
+
+        } catch (const exception& e) {
+            report(false, "combine: successful merge", "Base + Incoming", "combine_environments()", "No exception", e.what());
+        }
+    }
+
+    void test_combine_environments_collision() {
+        ProgramEnvironment base_env;
+        base_env.variables["VAR_A"] = make_var("a");
+
+        ProgramEnvironment incoming_env;
+        incoming_env.variables["VAR_A"] = make_var("a_prime");
+
+        bool threw_error = false;
+        string error_msg = "";
+
+        try {
+            base_env.combine_environments(&incoming_env);
+        } catch (const runtime_error& e) {
+            threw_error = true;
+            error_msg = e.what();
+        }
+
+        bool expected_msg = (error_msg.find("VAR_A") != string::npos);
+        report(threw_error && expected_msg, "combine: collision detection", "Base(VAR_A) + Incoming(VAR_A)", "combine_environments()", "Throws runtime_error mentioning VAR_A", threw_error ? "Threw: " + error_msg : "Did not throw");
+
+        for (auto& pair : base_env.variables) delete pair.second;
+        for (auto& pair : incoming_env.variables) delete pair.second;
+    }
+
+    void test_express_function() {
+        ProgramEnvironment env;
+        
+        // Setup mock environment with standard combinators
+        env.variables["ID"] = make_lambda("x", make_var("x"));
+        env.variables["TRUE"] = make_lambda("t", make_lambda("f", make_var("t")));
+        env.variables["FALSE"] = make_lambda("t", make_lambda("f", make_var("f")));
+
+        // 1. Edge Case: Null Pointer
+        lambda_expression* null_res = env.express(nullptr);
+        report(null_res == nullptr, "express: nullptr safety", "nullptr", "express()", "nullptr", null_res == nullptr ? "nullptr" : "Not nullptr");
+
+        // 2. Edge Case: Variable Node (Should remain completely unchanged)
+        lambda_expression* var_target = make_var("z");
+        lambda_expression* var_res = env.express(var_target);
+        report(var_res->to_string() == "z", "express: variable pass-through", "z", "express()", "z", var_res->to_string());
+        delete var_res; // Clean up because express didn't replace/delete it
+
+        // 3. Success: Direct Alpha-Equivalent Lambda Match
+        lambda_expression* id_target = make_lambda("a", make_var("a")); // \a.a
+        lambda_expression* id_res = env.express(id_target);
+        report(id_res->type == NodeType::VARIABLE && id_res->name == "ID", 
+               "express: exact lambda match", "\\a.a", "express()", "ID", id_res->to_string());
+        delete id_res; // Clean up the newly generated variable node
+
+        // 4. Failure Case: No Match in Environment
+        lambda_expression* no_match_target = make_lambda("x", make_var("y")); // \x.y
+        lambda_expression* no_match_res = env.express(no_match_target);
+        bool no_match_success = (no_match_res->type == NodeType::LAMBDA);
+        report(no_match_success, "express: no match found", "\\x.y", "express()", "Unchanged AST", no_match_res->type == NodeType::LAMBDA ? "Unchanged AST" : "Changed AST");
+        delete no_match_res;
+
+        // 5. Success: Nested Application Recursive Match
+        // Target: (\a.\b.a) (\c.\d.d) -> Should evaluate to TRUE FALSE
+        lambda_expression* app_target = make_app(
+            make_lambda("a", make_lambda("b", make_var("a"))), 
+            make_lambda("c", make_lambda("d", make_var("d")))
+        );
+        lambda_expression* app_res = env.express(app_target);
+        
+        bool app_success = (app_res->type == NodeType::APPLICATION && 
+                            app_res->expression_1->type == NodeType::VARIABLE && app_res->expression_1->name == "TRUE" && 
+                            app_res->expression_2->type == NodeType::VARIABLE && app_res->expression_2->name == "FALSE");
+        
+        report(app_success, "express: nested recursion match", "(\\a.\\b.a) (\\c.\\d.d)", "express()", "Application(TRUE, FALSE)", app_res->to_string());
+        delete app_res;
+
+        // Clean up environment
+        for (auto& pair : env.variables) {
+            delete pair.second;
+        }
+    }
+
+    // ---- NAMESPACE ENTRY POINT ----
+    pair<int,int> run_tests(bool verbose_flag, bool quiet_flag) {
+        if (verbose_flag) verbosity = Verbosity::VERBOSE;
+        else if (quiet_flag) verbosity = Verbosity::QUIET;
+        else verbosity = Verbosity::NORMAL;
+
+        tests_passed = 0;
+        tests_failed = 0;
+
+        if (verbosity != Verbosity::QUIET) {
+            cout << "\n=== ENVIRONMENT TEST SUITE ===\n";
+            string mode = (verbosity == Verbosity::VERBOSE) ? "VERBOSE" : "NORMAL";
+            cout << "Running in " << mode << " mode\n\n";
+        }
+
+        // Run Tests
+        test_all_files();
+        test_combine_environments_success();
+        test_combine_environments_collision();
+        test_express_function();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n=== RESULTS ===\n";
+        else cout << "[Environment Tests] ";
+
+        const string RESET = "\033[0m";
+        const string BOLD_GREEN = "\033[1;32m";
+        const string BOLD_RED = "\033[1;31m";
+
+        if (tests_failed == 0) {
+            cout << BOLD_GREEN << tests_passed << " passed, " << tests_failed << " failed" << RESET << "\n";
+        } else {
+            cout << BOLD_RED << tests_passed << " passed, " << tests_failed << " failed" << RESET << "\n";
+        }
+
+        return {tests_passed, tests_failed};
+    }
+}
+
+================================================================================
+FILE: tests\lambda_expression_tests.cpp
+================================================================================
+
+#include <string>
+#include <iostream>
+#include "../include/lambda_expression.h"
+
+using namespace std;
+
+namespace ExprTests {
+
+    // ---- test configuration ----
+    enum class Verbosity { QUIET, NORMAL, VERBOSE };
+    static Verbosity verbosity = Verbosity::NORMAL;  
+
+    int tests_passed = 0;
+    int tests_failed = 0;
+
+    // ---- helper functions ----
+    lambda_expression* make_I() { return make_lambda("x", make_var("x")); }
+    lambda_expression* make_K() { return make_lambda("x", make_lambda("y", make_var("x"))); }
+    lambda_expression* make_KI() { return make_lambda("x", make_lambda("y", make_var("y"))); }
+    lambda_expression* make_omega() {
+        lambda_expression* self_app = make_lambda("x", make_app(make_var("x"), make_var("x")));
+        return make_app(self_app, lambda_expression::deepcopy(self_app));
+    }
+
+    // ---- Unified Reporter ----
+    void report(bool pass, const string& name, const string& input, 
+                const string& op, const string& expected, const string& actual) {
+        if (pass) {
+            ++tests_passed;
+            if (verbosity != Verbosity::QUIET) cout << "PASS " << name << "\n";
+        } else {
+            ++tests_failed;
+            if (verbosity != Verbosity::QUIET) cout << "FAIL " << name << "\n";
+        }
+
+        // Print details if verbose, or if the test failed in normal mode
+        if (verbosity == Verbosity::VERBOSE || (!pass && verbosity == Verbosity::NORMAL)) {
+            cout << "   Input:     " << input << "\n";
+            cout << "   Operation: " << op << "\n";
+            cout << "   Expected:  " << expected << "\n";
+            cout << "   Actual:    " << actual << "\n";
+            cout << "   ---------------------------------------\n";
+        }
+    }
+
+
+    // ==========================================
+    //                 TESTS
+    // ==========================================
+
+    // ---- to_string tests ----
+    void test_to_string_variable() {
+        lambda_expression* v = make_var("x");
+        string actual = v->to_string();
+        report(actual == "x", "to_string: variable", "make_var(x)", "to_string()", "x", actual);
+        delete v;
+    }
+
+    void test_to_string_lambda() {
+        lambda_expression* expr = make_lambda("x", make_var("x"));
+        string actual = expr->to_string();
+        report(actual == "(λx. x)", "to_string: lambda", "make_lambda(x, x)", "to_string()", "(λx. x)", actual);
+        delete expr;
+    }
+
+    void test_to_string_application() {
+        lambda_expression* expr = make_app(make_lambda("x", make_var("x")), make_var("y"));
+        string actual = expr->to_string();
+        report(actual == "((λx. x) y)", "to_string: application", "make_app(λx.x, y)", "to_string()", "((λx. x) y)", actual);
+        delete expr;
+    }
+
+    void test_to_string_nested_lambda() {
+        lambda_expression* expr = make_lambda("x", make_lambda("y", make_var("x")));
+        string actual = expr->to_string();
+        report(actual == "(λx. (λy. x))", "to_string: nested lambda", "make_lambda(x, λy.x)", "to_string()", "(λx. (λy. x))", actual);
+        delete expr;
+    }
+
+    // ---- rename_free tests ----
+    void test_rename_free_variable_match() {
+        lambda_expression* v = make_var("x");
+        v->rename_free("x", "x'");
+        string actual = v->to_string();
+        report(actual == "x'", "rename_free: variable match", "x", "rename_free(x, x')", "x'", actual);
+        delete v;
+    }
+
+    void test_rename_free_variable_no_match() {
+        lambda_expression* v = make_var("y");
+        v->rename_free("x", "x'");
+        string actual = v->to_string();
+        report(actual == "y", "rename_free: variable no match", "y", "rename_free(x, x')", "y", actual);
+        delete v;
+    }
+
+    void test_rename_free_application() {
+        lambda_expression* expr = make_app(make_var("x"), make_var("y"));
+        expr->rename_free("x", "z");
+        string actual = expr->to_string();
+        report(actual == "(z y)", "rename_free: application", "(x y)", "rename_free(x, z)", "(z y)", actual);
+        delete expr;
+    }
+
+    void test_rename_free_lambda_shadow() {
+        lambda_expression* expr = make_lambda("x", make_var("x"));
+        expr->rename_free("x", "y");
+        string actual = expr->to_string();
+        report(actual == "(λy. y)", "rename_free: lambda shadow", "(λx. x)", "rename_free(x, y)", "(λy. y)", actual);
+        delete expr;
+    }
+
+    void test_rename_free_lambda_no_shadow() {
+        lambda_expression* expr = make_lambda("y", make_var("x"));
+        expr->rename_free("x", "z");
+        string actual = expr->to_string();
+        report(actual == "(λy. z)", "rename_free: lambda no shadow", "(λy. x)", "rename_free(x, z)", "(λy. z)", actual);
+        delete expr;
+    }
+
+    // ---- rename_bound tests ----
+    void test_rename_bound_simple() {
+        lambda_expression* expr = make_lambda("x", make_var("x"));
+        expr->rename_bound("x", "y");
+        string actual = expr->to_string();
+        report(actual == "(λx. x)", "rename_bound: simple rename", "(λx. x)", "rename_bound(x, y)", "(λx. x)", actual);
+        delete expr;
+    }
+
+    void test_rename_bound_stops_at_inner_shadow() {
+        lambda_expression* inner = make_lambda("x", make_var("x"));
+        lambda_expression* outer = make_lambda("x", inner);
+        outer->rename("x", "y");
+        string actual = outer->to_string();
+        report(actual == "(λy. (λx. x))", "rename_bound: stops at inner shadow", "(λx. (λx. x))", "rename(x, y)", "(λy. (λx. x))", actual);
+        delete outer;
+    }
+
+    // ---- substitute tests ----
+    void test_substitute_variable_match() {
+        lambda_expression* v = make_var("x");
+        lambda_expression* repl = make_var("y");
+        v->substitute("x", repl);
+        string actual = v->to_string();
+        report(actual == "y", "substitute: variable match", "x", "substitute(x, y)", "y", actual);
+        delete v;
+        delete repl;
+    }
+
+    void test_substitute_variable_no_match() {
+        lambda_expression* v = make_var("z");
+        lambda_expression* repl = make_var("y");
+        v->substitute("x", repl);
+        string actual = v->to_string();
+        report(actual == "z", "substitute: variable no match", "z", "substitute(x, y)", "z", actual);
+        delete v;
+        delete repl;
+    }
+
+    void test_substitute_application() {
+        lambda_expression* expr = make_app(make_var("x"), make_var("x"));
+        lambda_expression* repl = make_var("y");
+        expr->substitute("x", repl);
+        string actual = expr->to_string();
+        report(actual == "(y y)", "substitute: application", "(x x)", "substitute(x, y)", "(y y)", actual);
+        delete expr;
+        delete repl;
+    }
+
+    void test_substitute_under_lambda_no_capture() {
+        lambda_expression* expr = make_lambda("y", make_var("x"));
+        lambda_expression* repl = make_var("y");
+        expr->substitute("x", repl);
+        string actual = expr->to_string();
+        report(actual == "(λy'. y)", "substitute: under lambda (no capture)", "(λy. x)", "substitute(x, y)", "(λy'. y)", actual);
+        delete expr;
+        delete repl;
+    }
+
+    void test_substitute_avoids_capture() {
+        lambda_expression* inner = make_lambda("y", make_var("x"));
+        lambda_expression* outer = make_lambda("x", inner);
+        lambda_expression* repl = make_var("y");
+        outer->substitute("x", repl);
+        string actual = outer->to_string();
+        bool is_avoided = (actual != "(λy. y)") && (actual.find("λy") != string::npos);
+        report(is_avoided, "substitute: avoids capture", "(λx. (λy. x))", "substitute(x, y)", "(λy'. y)", actual);
+        delete outer;
+        delete repl;
+    }
+
+    void test_substitute_shadowing() {
+        lambda_expression* expr = make_lambda("x", make_var("x"));
+        lambda_expression* repl = make_var("y");
+        expr->substitute("x", repl);
+        string actual = expr->to_string();
+        report(actual == "(λx. x)", "substitute: shadowing stops substitution", "(λx. x)", "substitute(x, y)", "(λx. x)", actual);
+        delete expr;
+        delete repl;
+    }
+
+    // ---- is_valid tests ----
+    void test_is_valid_variable() {
+        lambda_expression* v = make_var("x");
+        bool valid = v->is_valid();
+        report(valid, "is_valid: variable", "make_var(x)", "is_valid()", "true", valid ? "true" : "false");
+        delete v;
+    }
+
+    void test_is_valid_lambda() {
+        lambda_expression* expr = make_lambda("x", make_var("x"));
+        bool valid = expr->is_valid();
+        report(valid, "is_valid: lambda", "make_lambda(x, x)", "is_valid()", "true", valid ? "true" : "false");
+        delete expr;
+    }
+
+    void test_is_valid_application() {
+        lambda_expression* expr = make_app(make_var("x"), make_var("y"));
+        bool valid = expr->is_valid();
+        report(valid, "is_valid: application", "make_app(x, y)", "is_valid()", "true", valid ? "true" : "false");
+        delete expr;
+    }
+
+    void test_is_valid_rejects_variable_with_children() {
+        lambda_expression* v = make_var("x");
+        v->expression_1 = make_var("y");
+        bool valid = v->is_valid();
+        report(!valid, "is_valid: rejects variable with child", "Variable with expression_1", "is_valid()", "false", valid ? "true" : "false");
+        v->expression_1 = nullptr; // prevent double delete
+        delete v;
+    }
+
+    void test_is_valid_rejects_application_with_name() {
+        lambda_expression* expr = make_app(make_var("x"), make_var("y"));
+        expr->name = "bad";
+        bool valid = expr->is_valid();
+        report(!valid, "is_valid: rejects application with name", "Application with name='bad'", "is_valid()", "false", valid ? "true" : "false");
+        expr->name = "";
+        delete expr;
+    }
+
+    void test_is_valid_rejects_lambda_without_body() {
+        lambda_expression* expr = new lambda_expression();
+        expr->type = NodeType::LAMBDA;
+        expr->name = "x";
+        expr->expression_1 = nullptr;
+        expr->expression_2 = nullptr;
+        bool valid = expr->is_valid();
+        report(!valid, "is_valid: rejects lambda without body", "Lambda without expression_1", "is_valid()", "false", valid ? "true" : "false");
+        delete expr;
+    }
+
+    // ---- is_redux tests ----
+    void test_is_redux_true() {
+        lambda_expression* expr = make_app(make_lambda("x", make_var("x")), make_var("y"));
+        bool redux = expr->is_redux();
+        report(redux, "is_redux: true", "((λx. x) y)", "is_redux()", "true", redux ? "true" : "false");
+        delete expr;
+    }
+
+    void test_is_redux_false_not_lambda() {
+        lambda_expression* expr = make_app(make_var("x"), make_var("y"));
+        bool redux = expr->is_redux();
+        report(!redux, "is_redux: false (not lambda)", "(x y)", "is_redux()", "false", redux ? "true" : "false");
+        delete expr;
+    }
+
+    void test_is_redux_false_not_application() {
+        lambda_expression* expr = make_lambda("x", make_var("x"));
+        bool redux = expr->is_redux();
+        report(!redux, "is_redux: false (not application)", "(λx. x)", "is_redux()", "false", redux ? "true" : "false");
+        delete expr;
+    }
+
+    // ---- reduce tests ----
+    void test_reduce_identity() {
+        lambda_expression* expr = make_app(make_lambda("x", make_var("x")), make_var("y"));
+        string input = expr->to_string();
+        expr->reduce();
+        string actual = expr->to_string();
+        report(actual == "y", "reduce: identity", input, "reduce()", "y", actual);
+        delete expr;
+    }
+
+    void test_reduce_const() {
+        lambda_expression* expr = make_app(make_lambda("x", make_var("z")), make_var("y"));
+        string input = expr->to_string();
+        expr->reduce();
+        string actual = expr->to_string();
+        report(actual == "z", "reduce: constant function", input, "reduce()", "z", actual);
+        delete expr;
+    }
+
+    void test_reduce_no_redex() {
+        lambda_expression* expr = make_app(make_var("x"), make_var("y"));
+        string input = expr->to_string();
+        expr->reduce();
+        string actual = expr->to_string();
+        report(actual == input, "reduce: no redex (unchanged)", input, "reduce()", input, actual);
+        delete expr;
+    }
+
+    void test_reduce_nested() {
+        lambda_expression* expr = make_app(
+            make_lambda("x", make_lambda("y", make_var("x"))),
+            make_var("z")
+        );
+        string input = expr->to_string();
+        expr->reduce();
+        string actual = expr->to_string();
+        report(actual == "(λy. z)", "reduce: nested lambda result", input, "reduce()", "(λy. z)", actual);
+        delete expr;
+    }
+
+    void test_reduce_with_capture_avoidance() {
+        lambda_expression* expr = make_app(
+            make_lambda("x", make_lambda("y", make_var("x"))),
+            make_var("y")
+        );
+        string input = expr->to_string();
+        expr->reduce();
+        string actual = expr->to_string();
+        bool avoided = (actual != "(λy. y)") && (actual.find("λy") != string::npos);
+        report(avoided, "reduce: capture avoidance", input, "reduce()", "(λy'. y)", actual);
+        delete expr;
+    }
+
+    // ---- deepcopy tests ----
+    void test_deepcopy_complex_shadowing() {
+        lambda_expression* original = make_lambda("x", 
+                                        make_lambda("x", 
+                                            make_lambda("x", 
+                                                make_lambda("x", make_var("x")))));
+        
+        lambda_expression* copy = lambda_expression::deepcopy(original);
+        string original_str = original->to_string();
+        string copy_str = copy->to_string();
+        
+        report(original_str == copy_str, "deepcopy: complex equality", original_str, "deepcopy()", copy_str, original_str);
+        report(copy_str == "(λx. (λx. (λx. (λx. x))))", "deepcopy: complex format", "(λx. (λx. (λx. (λx. x))))", "to_string()", "(λx. (λx. (λx. (λx. x))))", copy_str);
+        
+        delete original;
+        string after_delete = copy->to_string();
+        report(after_delete == copy_str, "deepcopy: complex independence", copy_str, "delete original", copy_str, after_delete);
+        delete copy;
+    }
+
+    void test_deepcopy_identity() {
+        lambda_expression* original = make_lambda("x", make_var("x"));
+        lambda_expression* copy = lambda_expression::deepcopy(original);
+        string original_str = original->to_string();
+        string copy_str = copy->to_string();
+        
+        report(original_str == copy_str, "deepcopy: identity equality", original_str, "deepcopy()", copy_str, original_str);
+        report(copy_str == "(λx. x)", "deepcopy: identity format", "(λx. x)", "to_string()", "(λx. x)", copy_str);
+        
+        delete original;
+        string after_delete = copy->to_string();
+        report(after_delete == "(λx. x)", "deepcopy: identity independence", "(λx. x)", "delete original", "(λx. x)", after_delete);
+        delete copy;
+    }
+
+    void test_deepcopy_single_var() {
+        lambda_expression* original = make_var("x");
+        lambda_expression* copy = lambda_expression::deepcopy(original);
+        string original_str = original->to_string();
+        string copy_str = copy->to_string();
+        
+        report(original_str == copy_str, "deepcopy: single var equality", original_str, "deepcopy()", copy_str, original_str);
+        report(copy->name == "x", "deepcopy: single var name", "x", "check name", "x", copy->name);
+        
+        delete original;
+        report(copy->name == "x", "deepcopy: single var independence", "x", "delete original", "x", copy->name);
+        delete copy;
+    }
+
+    // ---- normal order reduction tests ----
+    void test_normal_order_reduction() {
+        lambda_expression* kite = make_KI();
+        lambda_expression* omega_1 = make_omega();
+        lambda_expression* x_var_1 = make_var("x");
+        lambda_expression* test1 = make_app(make_app(kite, omega_1), x_var_1);
+        string input1 = test1->to_string();
+        
+        for(int i = 0; i < 20; ++i) test1->reduce(); 
+        string actual1 = test1->to_string();
+        report(actual1 == "x", "test_lazy_KI_Omega_x", input1, "reduce() x20", "x", actual1);
+
+        lambda_expression* kestrel = make_K();
+        lambda_expression* identity = make_I();
+        lambda_expression* omega_2 = make_omega();
+        lambda_expression* x_var_2 = make_var("x");
+        lambda_expression* test2 = make_app(make_app(make_app(kestrel, identity), omega_2), x_var_2);
+        string input2 = test2->to_string();
+        
+        for(int i = 0; i < 20; ++i) test2->reduce();
+        string actual2 = test2->to_string();
+        report(actual2 == "x", "test_lazy_K_I_Omega_x", input2, "reduce() x20", "x", actual2);
+
+        delete test1;
+        delete test2;
+    }
+
+    void test_eval_divergent_omega_KI() {
+        lambda_expression* kite = make_KI();
+        lambda_expression* omega = make_omega();
+        lambda_expression* x_var = make_var("x");
+        lambda_expression* test = make_app(make_app(kite, omega), x_var);
+        string input = test->to_string();
+        
+        try {
+            for(int i = 0; i < 20; ++i) test->reduce(); 
+        } catch (...) {}
+
+        string actual = test->to_string();
+        report(actual == "x", "eval: explicit KI Omega x", input, "Normal Order Reduce (x20)", "x", actual);
+        delete test;
+    }
+
+    void test_eval_deep_redex() {
+        lambda_expression* identity = make_I();
+        lambda_expression* expr = make_lambda("x", make_app(identity, make_var("x")));
+        string input = expr->to_string();
+        
+        expr->reduce(); 
+        string actual = expr->to_string();
+        
+        report(actual == "(λx. x)", "eval: deep redex", input, "recursive reduce()", "(λx. x)", actual);
+        delete expr;
+    }
+
+    void test_eval_shadowing_reduction() {
+        lambda_expression* inner = make_lambda("x", make_var("x"));
+        lambda_expression* outer = make_lambda("x", inner);
+        lambda_expression* test = make_app(outer, make_var("y"));
+        string input = test->to_string();
+        
+        test->reduce();
+        string actual = test->to_string();
+        
+        report(actual == "(λx. x)", "eval: shadowing reduction", input, "reduce()", "(λx. x)", actual);
+        delete test;
+    }
+
+    // ---- NAMESPACE ENTRY POINT ----
+    pair<int,int> run_tests(bool verbose_flag, bool quiet_flag) {
+        if (verbose_flag) verbosity = Verbosity::VERBOSE;
+        else if (quiet_flag) verbosity = Verbosity::QUIET;
+        else verbosity = Verbosity::NORMAL;
+
+        tests_passed = 0;
+        tests_failed = 0;
+
+        if (verbosity != Verbosity::QUIET) {
+            cout << "\n=== LAMBDA ENGINE TEST SUITE ===\n";
+            string mode = (verbosity == Verbosity::VERBOSE) ? "VERBOSE" : "NORMAL";
+            cout << "Running in " << mode << " mode\n\n";
+
+            cout << "-- to_string --\n";
+        }
+        test_to_string_variable();
+        test_to_string_lambda();
+        test_to_string_application();
+        test_to_string_nested_lambda();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- rename_free --\n";
+        test_rename_free_variable_match();
+        test_rename_free_variable_no_match();
+        test_rename_free_application();
+        test_rename_free_lambda_shadow();
+        test_rename_free_lambda_no_shadow();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- rename_bound --\n";
+        test_rename_bound_simple();
+        test_rename_bound_stops_at_inner_shadow();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- substitute --\n";
+        test_substitute_variable_match();
+        test_substitute_variable_no_match();
+        test_substitute_application();
+        test_substitute_under_lambda_no_capture();
+        test_substitute_avoids_capture();
+        test_substitute_shadowing();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- is_valid --\n";
+        test_is_valid_variable();
+        test_is_valid_lambda();
+        test_is_valid_application();
+        test_is_valid_rejects_variable_with_children();
+        test_is_valid_rejects_application_with_name();
+        test_is_valid_rejects_lambda_without_body();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- is_redux --\n";
+        test_is_redux_true();
+        test_is_redux_false_not_lambda();
+        test_is_redux_false_not_application();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- reduce --\n";
+        test_reduce_identity();
+        test_reduce_const();
+        test_reduce_no_redex();
+        test_reduce_nested();
+        test_reduce_with_capture_avoidance();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- deepcopy --\n";
+        test_deepcopy_complex_shadowing();
+        test_deepcopy_identity();
+        test_deepcopy_single_var();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- evaluations --\n";
+        test_normal_order_reduction();
+        test_eval_divergent_omega_KI();
+        test_eval_deep_redex();
+        test_eval_shadowing_reduction();
+
+        // Final output is ALWAYS printed, even in QUIET mode
+        if (verbosity != Verbosity::QUIET) cout << "\n=== RESULTS ===\n";
+        else cout << "[AST Engine Tests] ";
+        
+        // Add these constants near the top of your function (or globally)
+        const string RESET = "\033[0m";
+        const string BOLD_GREEN = "\033[1;32m";
+        const string BOLD_RED = "\033[1;31m";
+
+        // Replace your final cout with this logic:
+        if (tests_failed == 0) {
+            // 100% Passed: Bold Green
+            cout << BOLD_GREEN << tests_passed << " passed, " << tests_failed << " failed" << RESET << "\n";
+        } else {
+            // 1 or more Failed: Bold Red
+            cout << BOLD_RED << tests_passed << " passed, " << tests_failed << " failed" << RESET << "\n";
+        }
+
+        return {tests_passed, tests_failed};
+    }
+}
+
+================================================================================
+FILE: tests\lambda_parser_tests.cpp
+================================================================================
+
+#include <string>
+#include <iostream>
+#include <sstream>
+#include "../include/lambda_parser.h"
+
+using namespace std;
+
+namespace ParserTests {
+
+    // ---- test configuration ----
+    enum class Verbosity { QUIET, NORMAL, VERBOSE };
+    static Verbosity verbosity = Verbosity::NORMAL;  
+
+    int tests_passed = 0;
+    int tests_failed = 0;
+
+    // ---- Unified Reporter ----
+    void report(bool pass, const string& name, const string& input, 
+                const string& op, const string& expected, const string& actual) {
+        if (pass) {
+            ++tests_passed;
+            if (verbosity != Verbosity::QUIET) cout << "PASS " << name << "\n";
+        } else {
+            ++tests_failed;
+            if (verbosity != Verbosity::QUIET) cout << "FAIL " << name << "\n";
+        }
+
+        if (verbosity == Verbosity::VERBOSE || (!pass && verbosity == Verbosity::NORMAL)) {
+            cout << "   Input:     " << input << "\n";
+            cout << "   Operation: " << op << "\n";
+            cout << "   Expected:  " << expected << "\n";
+            cout << "   Actual:    " << actual << "\n";
+            cout << "   ---------------------------------------\n";
+        }
+    }
+
+    // ---- Parser Test Helper ----
+    void check_parse(const string& input, const string& expected, const string& test_name) {
+        
+        // 1. Setup the dummy buffer and save the original terminal output
+        stringstream dummy_buffer;
+        streambuf* original_cout = cout.rdbuf();
+
+        // 2. If in quiet mode, redirect all 'cout' to the black hole
+        if (verbosity == Verbosity::QUIET) {
+            cout.rdbuf(dummy_buffer.rdbuf());
+        }
+
+        // 3. Run the engine
+        lambda_expression* expr = parse_string(input); 
+        
+        // 4. Instantly restore terminal output so our test reporter can print
+        if (verbosity == Verbosity::QUIET) {
+            cout.rdbuf(original_cout);
+        }
+        
+        if (expr == nullptr) {
+            report(expected == "ERROR", test_name, input, "parse_string()", expected, "nullptr (Caught Error)");
+        } else {
+            string actual = expr->to_string();
+            report(actual == expected, test_name, input, "parse_string()", expected, actual);
+            delete expr;
+        }
+    }
+
+    // ==========================================
+    // PARSER TEST SUITE
+    // ==========================================
+
+    void test_parser_basics() {
+        check_parse("x", "x", "parse: single variable");
+        check_parse("\\x. x", "(λx. x)", "parse: simple lambda (backslash)");
+        check_parse("lambda y . y", "(λy. y)", "parse: simple lambda (keyword)");
+        check_parse("x y", "(x y)", "parse: simple application");
+    }
+
+    void test_parser_associativity() {
+        check_parse("x y z", "((x y) z)", "parse: left-associative application");
+        check_parse("a b c d", "(((a b) c) d)", "parse: deep left-associativity");
+        check_parse("x (y z)", "(x (y z))", "parse: parentheses grouping right");
+        check_parse("(x y) z", "((x y) z)", "parse: parentheses grouping left");
+    }
+
+    void test_parser_greedy_scope() {
+        check_parse("\\x. a b", "(λx. (a b))", "parse: greedy lambda scope");
+        check_parse("(\\x. a) b", "((λx. a) b)", "parse: parenthesis bounds scope");
+    }
+
+    void test_parser_currying() {
+        check_parse("lambda x y . x", "(λx. (λy. x))", "parse: double curry (K combinator)");
+        check_parse("\\x y z . (x z) (y z)", "(λx. (λy. (λz. ((x z) (y z)))))", "parse: triple curry (S combinator)");
+    }
+
+    void test_parser_combinators() {
+        check_parse("(\\x. x x) (\\x. x x)", "((λx. (x x)) (λx. (x x)))", "parse: Omega combinator");
+        check_parse("\\f. (\\x. f (x x)) (\\x. f (x x))", 
+                    "(λf. ((λx. (f (x x))) (λx. (f (x x)))))", 
+                    "parse: Y combinator");
+    }
+
+    void test_parser_errors() {
+        check_parse("(x y", "ERROR", "error: missing closing parenthesis");
+        check_parse("\\x y z", "ERROR", "error: missing dot in lambda");
+        check_parse("\\ . x", "ERROR", "error: lambda missing bound variable");
+        check_parse("()", "ERROR", "error: empty parenthesis");
+    }
+
+    // ---- NAMESPACE ENTRY POINT ----
+    pair<int,int> run_tests(bool verbose_flag, bool quiet_flag) {
+        if (verbose_flag) verbosity = Verbosity::VERBOSE;
+        else if (quiet_flag) verbosity = Verbosity::QUIET;
+        else verbosity = Verbosity::NORMAL;
+
+        tests_passed = 0;
+        tests_failed = 0;
+
+        if (verbosity != Verbosity::QUIET) {
+            cout << "\n=== PARSER TEST SUITE ===\n";
+            string mode = (verbosity == Verbosity::VERBOSE) ? "VERBOSE" : "NORMAL";
+            cout << "Running in " << mode << " mode\n\n";
+
+            cout << "-- Basics --\n";
+        }
+        test_parser_basics();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- Associativity & Scope --\n";
+        test_parser_associativity();
+        test_parser_greedy_scope();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- Currying & Combinators --\n";
+        test_parser_currying();
+        test_parser_combinators();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n-- Error Handling (Should not crash) --\n";
+        test_parser_errors();
+
+        if (verbosity != Verbosity::QUIET) cout << "\n=== RESULTS ===\n";
+        else cout << "[Parser Tests] ";
+
+        const string RESET = "\033[0m";
+        const string BOLD_GREEN = "\033[1;32m";
+        const string BOLD_RED = "\033[1;31m";
+
+        if (tests_failed == 0) {
+            cout << BOLD_GREEN << tests_passed << " passed, " << tests_failed << " failed" << RESET << "\n";
+        } else {
+            cout << BOLD_RED << tests_passed << " passed, " << tests_failed << " failed" << RESET << "\n";
+        }
+
+        return {tests_passed, tests_failed};
+    }
+}
+
+================================================================================
+FILE: tests\master_tester.cpp
+================================================================================
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <utility>
+
+using namespace std;
+
+// 1. Declare the namespaces and functions 
+// (Updated to match the pair<int, int> return type)
+namespace ExprTests { pair<int,int> run_tests(bool verbose, bool quiet); }
+namespace ParserTests { pair<int,int> run_tests(bool verbose, bool quiet); }
+namespace EnvironmentTests { pair<int,int> run_tests(bool verbose, bool quiet); }
+
+// 2. Define a structure to hold the test metadata and function pointer
+struct TestModule {
+    string name;
+    pair<int,int> (*run)(bool, bool);
+};
+
+int main(int argc, char* argv[]) {
+    bool verbose = false;
+    bool quiet = false;
+
+    // Check for verbosity flags in the terminal
+    for (int i = 1; i < argc; ++i) {
+        string arg = argv[i];
+        if (arg == "-verbose" || arg == "--verbose" || arg == "-v") {
+            verbose = true;
+        } else if (arg == "-quiet" || arg == "--quiet" || arg == "-q") {
+            quiet = true;
+        }
+    }
+
+    // ==========================================
+    // THE TEST REGISTRY
+    // Add any future test modules to this vector!
+    // ==========================================
+    vector<TestModule> test_suite = {
+        {"AST Engine", ExprTests::run_tests},
+        {"Parser Frontend", ParserTests::run_tests},
+        {"Environment/File IO", EnvironmentTests::run_tests} // <--- Add this
+    };
+
+    if (!quiet) {
+        cout << "#############################################\n";
+        cout << "     FULL LAMBDA COMPILER TEST SUITE         \n";
+        cout << "#############################################\n";
+    }
+
+    int total_failures = 0;
+    int total_passed = 0;
+
+    // 3. Dynamically loop over all registered tests
+    // 3. Dynamically loop over all registered tests
+    for (const TestModule& module : test_suite) {
+        if (!quiet) cout << "\n>>> Running " << module.name << " Tests...\n";
+        
+        // Execute the test and unpack the pair
+        pair<int, int> results = module.run(verbose, quiet);
+        total_passed += results.first;
+        total_failures += results.second;
+    }
+
+    // ANSI Color Codes
+    const string RESET = "\033[0m";
+    const string BOLD_GREEN = "\033[1;32m";
+    const string BOLD_RED = "\033[1;31m";
+
+    if (!quiet) cout << "\n#############################################\n";
+    
+    // 4. Print the final aggregated summary in color
+    if (total_failures == 0) {
+        cout << BOLD_GREEN << "   ALL MODULES PASSED! SYSTEM IS STABLE.   \n";
+        cout << "   (Total: " << total_passed << " tests passed)\n" << RESET;
+    } else {
+        cout << BOLD_RED << "   SYSTEM FAILED WITH " << total_failures << " ERRORS.\n";
+        cout << "   (" << total_passed << " tests passed)\n" << RESET;
+    }
+    
+    if (!quiet) cout << "#############################################\n";
+
+    return total_failures > 0 ? 1 : 0;
+}

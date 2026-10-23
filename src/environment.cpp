@@ -1,10 +1,10 @@
 #include "../include/environment.h"
 #include "../include/lambda_parser.h"
 
-
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 #include <new> // Required for std::bad_alloc
 
 using namespace std;
@@ -42,19 +42,15 @@ string remove_comments(const string& source) {
     bool in_comment = false;
     
     for (size_t i = 0; i < source.length(); ++i) {
-        // Look ahead to see if the next three characters are quotes
         if (i + 2 < source.length() && source[i] == '"' && source[i+1] == '"' && source[i+2] == '"') {
-            in_comment = !in_comment; // Toggle the state (Open -> Close, or Close -> Open)
-            i += 2; // Skip the next two quotes so we don't process them again
-        } 
-        // Only keep characters if we are NOT inside a comment
-        else if (!in_comment) {
+            in_comment = !in_comment;
+            i += 2;
+        } else if (!in_comment) {
             result += source[i]; 
         }
     }
     
     if (in_comment) {
-        // We use '\"' to safely print quotation marks in the error message
         throw runtime_error("Syntax Error: Unclosed comment detected. Missing a closing '\"\"\"'.");
     }
     
@@ -128,9 +124,6 @@ ProgramEnvironment parse_program(const string& source_code) {
             if (!is_valid_var_name(var_name)) throw runtime_error("Syntax Error: Invalid variable name '" + var_name + "'");
             if (expr_str.empty()) throw runtime_error("Syntax Error: Missing expression for '" + var_name + "'");
 
-            // ==========================================
-            // COLLISION CHECK ADDED HERE
-            // ==========================================
             if (env.variables.find(var_name) != env.variables.end()) {
                 throw runtime_error("Syntax Error: Naming collision. The variable '" + var_name + "' is already defined.");
             }
@@ -138,10 +131,12 @@ ProgramEnvironment parse_program(const string& source_code) {
             lambda_expression* ast = parse_string(expr_str);
             if (!ast) throw runtime_error("Parse Error: Failed to build AST for '" + var_name + "'.");
 
-            for (const pair<string, lambda_expression*>& pair : env.variables) {
-                ast->substitute(pair.first, pair.second);
+            // Substitute in exact declaration order using const auto&
+            for (const string& prev_name : env.declaration_order) {
+                ast->substitute(prev_name, env.variables[prev_name]);
             }
             env.variables[var_name] = ast;
+            env.declaration_order.push_back(var_name);
         }
         
         start = end + 1;
@@ -159,70 +154,68 @@ ProgramEnvironment parse_program(const string& source_code) {
             throw runtime_error("Parse Error: Failed to build AST for the final evaluation block.");
         }
         
-        for (const pair<string, lambda_expression*>& pair : env.variables) {
-            env.evaluation_target->substitute(pair.first, pair.second);
+        for (const string& prev_name : env.declaration_order) {
+            env.evaluation_target->substitute(prev_name, env.variables[prev_name]);
         }
     }
 
     return env;
 }
 
+void ProgramEnvironment::clear() {
+    for (auto& pair : variables) {
+        delete pair.second;
+    }
+    variables.clear();
+    declaration_order.clear();
+    delete evaluation_target;
+    evaluation_target = nullptr;
+}
 
 void ProgramEnvironment::combine_environments(ProgramEnvironment* pe) {
     if (pe == nullptr) return;
 
-    for (const pair<string, lambda_expression*>& pair : pe->variables) {
+    // Use const auto& to prevent -Wrange-loop-construct temporary copies
+    for (const auto& pair : pe->variables) {
         const string& var_name = pair.first;
         lambda_expression* incoming_ast = pair.second;
 
-        // Check if the variable name already exists in OUR environment
         if (this->variables.find(var_name) != this->variables.end()) {
             throw runtime_error("Environment Merge Error: Naming collision detected. The variable '" + 
                                 var_name + "' already exists.");
         }
 
-        // If no collision, add it to our environment
         this->variables[var_name] = incoming_ast;
+        this->declaration_order.push_back(var_name);
     }
 
-    // Safety Step: Clear the incoming environment's variables so it doesn't 
-    // accidentally double-delete the AST pointers when it gets destroyed later.
     pe->variables.clear();
+    pe->declaration_order.clear();
 }
 
-/**
- * @brief Iterates through all stored variables in the environment and 
- * fully beta-reduces them to their Normal Form.
- * * This is a critical optimization pass. By ensuring all variables are in 
- * normal form, the compiler can use O(1) Alpha Equivalence structural 
- * checks during the resugaring (express) phase, rather than O(n^2) tree reductions.
- */
 void ProgramEnvironment::reduce_variables() {
-    // Iterate over every variable bound in the current environment
-    for (pair<const string, lambda_expression*>& env_var : this->variables) {
+    // Use auto& to directly modify the map values without temporary copies
+    for (auto& env_var : this->variables) {
         const string& var_name = env_var.first;
         lambda_expression* ast = env_var.second;
 
-        lambda_expression* copy = lambda_expression::deepcopy(ast);
-
         if (ast == nullptr) continue; 
 
+        lambda_expression* copy = lambda_expression::deepcopy(ast);
+
         try {
-            // Attempt to pre-evaluate the AST completely.
-            
             copy->reduce_total();
             delete ast;
             env_var.second = copy;
             
         } catch (const std::bad_alloc& e) {
-            // SWALLOW MEMORY EXPLOSION: Catches heap exhaustion anywhere in the AST.
+            delete copy;
             cerr << "[Warning] Variable '" << var_name 
                  << "' triggered Exponential Blowup (ran out of RAM) during pre-computation. "
                  << "It has been safely stored unreduced." << endl;
                  
         } catch (const runtime_error& e) {
-            // SWALLOW DIVERGENCE: Preserves lazy evaluation by allowing infinite 
-            // combinators to exist in the environment as long as they aren't executed.
+            delete copy;
             cerr << "[Warning] Variable '" << var_name 
                  << "' failed to reduce during pre-computation (" << e.what() << "). "
                  << "It has been safely stored unreduced." << endl;
@@ -235,27 +228,17 @@ lambda_expression* ProgramEnvironment::express(lambda_expression* target) {
 
     switch (target->type) {
         case NodeType::VARIABLE: 
-            // Variables are already fully folded, no need to check or recurse
             return target;
             
         case NodeType::LAMBDA: 
         case NodeType::APPLICATION: {
-            // 1. GREEDY PATTERN MATCHING (Maximal Munch)
-            // Check if this entire subtree is beta-equivalent to a saved variable.
-            for (const pair<string, lambda_expression*>& env_var : this->variables) {
-                
-                // Dereference the stored pointer to trigger your alpha_equivalence overload
+            // Use const auto& to avoid -Wrange-loop-construct warnings
+            for (const auto& env_var : this->variables) {
                 if (*target == *(env_var.second)) {
-                    
-                    // Memory Safety: Since we are replacing this entire complex subtree,
-                    // we must delete it to free the heap memory (which triggers its 
-                    // recursive destructor), and return a brand new, clean variable node.
                     delete target;
                     return make_var(env_var.first);
                 }
             }
-            // 2. RECURSION
-            // If the whole block didn't match anything, step one level deeper.
             if (target->type == NodeType::LAMBDA) {
                 target->expression_1 = express(target->expression_1);
             } else { // APPLICATION

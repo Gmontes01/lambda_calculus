@@ -20,28 +20,36 @@ using namespace std;
 vector<string> tokenize(const string& str) {
     vector<string> tokens;
     string curr_word = "";
-    
-    // The exact characters that trigger a split in Lambda Calculus grammar
     unordered_set<char> delimiters = {' ', '.', '(', ')', ';', '\\'};
 
-    for (char c : str) {
-        if (delimiters.count(c)) {
-            // If we were building a variable name, save it before processing the delimiter
+    for (size_t i = 0; i < str.length(); ++i) {
+        // Handle 2-byte UTF-8 lambda (0xCE 0xBB)
+        if (static_cast<unsigned char>(str[i]) == 0xCE && 
+            i + 1 < str.length() && 
+            static_cast<unsigned char>(str[i+1]) == 0xBB) {
+            
             if (!curr_word.empty()) {
                 tokens.push_back(curr_word);
                 curr_word = "";
             }
-            // Discard spaces, but keep mathematical symbols
+            tokens.push_back("λ");
+            i++; // Skip the second byte
+            continue;
+        }
+
+        char c = str[i];
+        if (delimiters.count(c)) {
+            if (!curr_word.empty()) {
+                tokens.push_back(curr_word);
+                curr_word = "";
+            }
             if (c != ' ') tokens.push_back(string(1, c));
         } else {
-            // Not a delimiter; accumulate into the current variable name
             curr_word += c;
         }
     }
     
-    // Flush any remaining characters in the buffer
     if (!curr_word.empty()) tokens.push_back(curr_word);
-    
     return tokens;
 }
 

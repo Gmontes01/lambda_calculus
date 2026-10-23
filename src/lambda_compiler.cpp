@@ -29,8 +29,8 @@ int main(int argc, char* argv[]) {
         ProgramEnvironment env = parse_program(source_code);
 
         cout << "=== Environment Loaded ===" << endl;
-        for (const pair<string, lambda_expression*>& pair : env.variables) {
-            cout << pair.first << " = " << pair.second->to_string() << endl;
+        for (const string& name : env.declaration_order) {
+            cout << name << " = " << env.variables[name]->to_string() << endl;
         }
         cout << "==========================\n" << endl;
 
@@ -45,18 +45,18 @@ int main(int argc, char* argv[]) {
             lambda_expression* simplified_lambda_ex = lambda_expression::deepcopy(env.evaluation_target);
             env.reduce_variables();
             
-            cout << "Result:     " << env.express(simplified_lambda_ex)->to_string() << endl;
-            
-            delete env.evaluation_target;
+            lambda_expression* expressed_result = env.express(simplified_lambda_ex);
+            cout << "Result:     " << expressed_result->to_string() << endl;
+            delete expressed_result; // Frees the resugared tree or variable node
         } else {
             cout << "No execution block found. Variables loaded successfully." << endl;
         }
-
 
     } catch (const exception& e) {
         cerr << "\n[COMPILER ERROR]\n" << e.what() << endl;
         return 1;
     }
 
+    // env and its internal AST pointers are safely reclaimed by ~ProgramEnvironment()
     return 0;
 }

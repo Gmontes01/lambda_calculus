@@ -4,5 +4,4 @@ NOT = \f x y. f y x;
 ************************
 My Custom Logic Test
 
-NOT 
-(TRUE)
+(\x y z. x z y) TRUE 
